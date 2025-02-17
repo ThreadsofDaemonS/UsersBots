@@ -77,7 +77,7 @@ async def send_typing_action(client, chat_id, duration=3):
 # ✅ Лайки (реакции) от ботов (вероятность 6% с задержкой)
 async def send_reaction(client, event):
     if random.random() < 0.06:  # 6% вероятность поставить эмодзи
-        await asyncio.sleep(random.randint(20, 120))  # Добавляем задержку 3-10 секунд
+        await asyncio.sleep(random.randint(20, 120))  # Добавляем задержку 20-120 секунд
         try:
             reaction_choices = ["👍", "❤️", "🔥", "💯"]
             chosen_reaction = random.choice(reaction_choices)
