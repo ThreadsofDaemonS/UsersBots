@@ -1,0 +1,168 @@
+import asyncio
+import random
+import re
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
+from telethon.tl.functions.messages import SetTypingRequest, SendReactionRequest
+from telethon.tl.types import SendMessageTypingAction, ReactionEmoji
+from openai import AsyncOpenAI
+from decouple import config
+
+# ✅ OpenAI API
+OPENAI_API_KEY = config("AI_API_KEY")
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# ✅ ID группы и OWNER_ID
+GROUP_ID = config("GROUP_ID", cast=int)
+OWNER_ID = config("OWNER_ID", cast=int)
+
+# ✅ Чат ID ботов
+CHAT_ID_BOT1 = config("CHAT_ID_BOT1", cast=int)
+CHAT_ID_BOT2 = config("CHAT_ID_BOT2", cast=int)
+
+# ✅ Данные юзер-ботов
+sessions = [
+    {
+        "phone": config("BOT1_PHONE"),
+        "api_id": config("BOT1_API_ID", cast=int),
+        "api_hash": config("BOT1_API_HASH"),
+        "session": config("BOT1_SESSION"),
+        "chat_id": CHAT_ID_BOT1
+    },
+    {
+        "phone": config("BOT2_PHONE"),
+        "api_id": config("BOT2_API_ID", cast=int),
+        "api_hash": config("BOT2_API_HASH"),
+        "session": config("BOT2_SESSION"),
+        "chat_id": CHAT_ID_BOT2
+    }
+]
+
+# ✅ Персонажи
+bot_profiles = {
+    CHAT_ID_BOT1: "Ты человек, который имитирует Дарта Вейдера. Говори как лорд ситхов, используя тёмную сторону силы.",
+    CHAT_ID_BOT2: "Ты человек, который имитирует Люка Скайуокера. Говори как джедай, ведущий борьбу против Империи."
+}
+
+# ✅ Общая тематика
+group_prompt = ("Это чат о Звёздных войнах. Боты должны вести естественный диалог как люди. Писать не больше 2-ух предложений в одном сообщении.\
+               Не ставить точки в конце предложений.На вопрос бот ли ты или какая у тебя модель - уходить от ответа ")
+
+# ✅ Храним последнее сообщение от другого бота
+last_bot_message = {bot["chat_id"]: None for bot in sessions}
+
+# ✅ Генерация текста через OpenAI
+async def generate_message(prompt):
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": prompt}],
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"⚠ Ошибка OpenAI: {e}")
+        return "Что-то пошло не так... (ошибка AI)"
+
+# ✅ Имитация набора текста
+async def send_typing_action(client, chat_id, duration=3):
+    try:
+        await client(SetTypingRequest(chat_id, SendMessageTypingAction()))
+        await asyncio.sleep(duration)
+    except Exception as e:
+        print(f"⚠ Ошибка SetTypingRequest: {e}")
+
+# ✅ Лайки (реакции) от ботов (вероятность 6% с задержкой)
+async def send_reaction(client, event):
+    if random.random() < 0.06:
+        await asyncio.sleep(random.randint(20, 120))
+        try:
+            reaction_choices = ["👍", "❤️", "🔥", "💯"]
+            chosen_reaction = random.choice(reaction_choices)
+            await client(SendReactionRequest(
+                peer=event.chat_id,
+                msg_id=event.id,
+                reaction=[ReactionEmoji(emoticon=chosen_reaction)]
+            ))
+        except Exception as e:
+            print(f"⚠ Ошибка при добавлении реакции: {e}")
+
+# ✅ Запуск бота
+async def run_bot(user, all_clients, reply_counter, dialog_started):
+    client = TelegramClient(StringSession(user["session"]), user["api_id"], user["api_hash"])
+    await client.start()
+    print(f"✅ Бот {user['phone']} подключен!")
+
+    bot_prompt = bot_profiles[user["chat_id"]]
+
+    @client.on(events.NewMessage(chats=GROUP_ID))
+    async def handler(event):
+        if event.out:
+            return  # Бот не отвечает сам себе
+
+        sender_id = event.sender_id
+        message_text = event.text.strip()
+
+        # ✅ ПОМЕЧАЕМ СООБЩЕНИЕ КАК ПРОЧИТАННОЕ
+        await client.send_read_acknowledge(event.chat_id, max_id=event.id)
+
+        # ✅ Если пишет OWNER_ID, боты начинают беседу
+        if sender_id == OWNER_ID and not dialog_started[0]:
+            dialog_started[0] = True
+            await send_typing_action(client, event.chat_id, duration=random.randint(10, 60))
+            response_prompt = f"{group_prompt}\n{bot_prompt}\nОтветь на сообщение и начни беседу."
+            message = await generate_message(response_prompt)
+            await client.send_message(GROUP_ID, message)
+
+        # ✅ Запоминаем последнее сообщение бота (но не реплай)
+        if sender_id in [bot["chat_id"] for bot in sessions]:
+            last_bot_message[user["chat_id"]] = message_text
+
+        # ✅ Если один бот написал, второй продолжает тему
+        if dialog_started[0] and sender_id in [bot["chat_id"] for bot in sessions if bot["chat_id"] != user["chat_id"]]:
+            if last_bot_message.get(user["chat_id"]):
+                await asyncio.sleep(random.randint(10, 60))
+                await send_typing_action(client, event.chat_id, duration=random.randint(10, 60))
+                follow_up_prompt = f"{group_prompt}\n{bot_prompt}\nСообщение другого бота: \"{last_bot_message[user['chat_id']]}\"\nПродолжи беседу."
+                follow_up_message = await generate_message(follow_up_prompt)
+                await client.send_message(GROUP_ID, follow_up_message)
+
+        # ✅ Обработка реплаев (цепочка сообщений)
+        if dialog_started[0] and event.is_reply:
+            replied_message = await event.get_reply_message()
+
+            # Найти оригинальный реплай в цепочке
+            while replied_message and replied_message.is_reply:
+                replied_message = await replied_message.get_reply_message()
+
+            replied_sender_id = replied_message.sender_id if replied_message else None
+
+            # ✅ Бот отвечает ТОЛЬКО если реплай адресован ему
+            if replied_sender_id == user["chat_id"]:
+                if event.id not in reply_counter:
+                    reply_counter[event.id] = 1  # Запоминаем, что ответ уже был
+
+                    await send_typing_action(client, event.chat_id, duration=random.randint(10, 60))
+
+                    # Всегда содержательный ответ
+                    response_prompt = f"{group_prompt}\n{bot_prompt}\nСообщение бота: \"{replied_message.text}\"\n\
+                    Пользователь написал: \"{message_text}\". Ответь в стиле персонажа."
+
+                    message = await generate_message(response_prompt)
+                    await event.reply(message)
+
+        # ✅ Лайк (без комментария)
+        await send_reaction(client, event)
+
+    all_clients.append(client)
+    await client.run_until_disconnected()
+
+# ✅ Запуск всех ботов
+async def main():
+    all_clients = []
+    reply_counter = {}
+    dialog_started = [False]
+    tasks = [run_bot(user, all_clients, reply_counter, dialog_started) for user in sessions]
+    await asyncio.gather(*tasks)
+
+asyncio.run(main())
